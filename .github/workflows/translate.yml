@@ -98,6 +98,32 @@ jobs:
           ps axu|grep vscode || true
           nc -vz localhost 59071 || echo "MCP server not yet ready"
 
+      - name: Setup cloudflared
+        uses: AnimMouse/setup-cloudflared@v2
+      
+      - name: Setup cloudflared tunnel
+        id: cloudflared
+        uses: AnimMouse/setup-cloudflared/tunnel@v2
+        with:
+          url: http://localhost:59071
+
+      - name: Extract and store tunnel URL
+        id: tunnel
+        run: |
+          # Wait a moment for the log to be written
+          sleep 2
+          
+          # Extract the tunnel URL from cloudflared logs
+          TUNNEL_URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' /home/runner/work/_temp/cloudflared.log | head -n 1)
+          
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Error: Could not extract tunnel URL from logs"
+            exit 1
+          fi
+          
+          echo "Tunnel URL: $TUNNEL_URL"
+          echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
+
       ## Provision TLA+ Tools
       ##
 
@@ -123,7 +149,7 @@ jobs:
       - name: Test MCP connection
         run: |
           cd python
-          python translate.py --test-mcp
+          python translate.py --test-mcp --mcp-url ${{ steps.tunnel.outputs.tunnel_url }}/mcp
         env:
           GITHUB_API_KEY: ${{ secrets.GITHUB_TOKEN }}
 
@@ -145,6 +171,9 @@ jobs:
             ARGS="$ARGS --debug"
           fi
           
+          # Add  --mcp-url ${{ steps.tunnel.outputs.tunnel_url }}/mcp
+          ARGS="$ARGS --mcp-url ${{ steps.tunnel.outputs.tunnel_url }}/mcp"
+
           # Add puzzle files
           ARGS="$ARGS ${{ github.event.inputs.puzzle_files }}"
           
