@@ -11,11 +11,65 @@ This file is automatically discovered by pytest and provides:
 import asyncio
 import logging
 import os
+import sys
 
 # CRITICAL: Disable LiteLLM's background logging worker BEFORE importing translate.py
-# This prevents "bound to a different event loop" errors in pytest
-# Must be set before litellm is imported (which happens when translate.py is imported)
-os.environ["LITELLM_DISABLE_LOGGING_WORKER"] = "true"
+# This prevents "bound to a different event loop" errors in pytest-asyncio
+# Must be configured before litellm is imported (which happens when translate.py is imported)
+
+# Set environment variables that litellm checks during initialization
+os.environ["LITELLM_LOG"] = "ERROR"  # Minimize logging
+os.environ["LITELLM_DROP_DEBUG_LOGS"] = "True"
+
+# Import litellm and configure it to disable async logging
+import litellm
+
+# Disable all async logging features
+litellm.turn_off_message_logging = True
+litellm.suppress_debug_info = True
+litellm.set_verbose = False
+
+# NUCLEAR FIX: Completely disable LoggingWorker by patching its methods
+try:
+    from litellm.litellm_core_utils.logging_worker import LoggingWorker
+    
+    # Patch _worker_loop to prevent it from accessing the queue
+    async def no_op_worker_loop(self):
+        """No-op replacement for LoggingWorker._worker_loop() to prevent event loop issues."""
+        # Just return immediately, don't try to access the queue
+        return
+    
+    # Patch start to do nothing
+    def no_op_start(self):
+        """No-op replacement for LoggingWorker.start()."""
+        # Don't create any tasks or queues
+        pass
+    
+    # Patch add_log to do nothing
+    def no_op_add_log(self, *args, **kwargs):
+        """No-op replacement for LoggingWorker.add_log()."""
+        pass
+    
+    # Apply all patches
+    LoggingWorker._worker_loop = no_op_worker_loop
+    LoggingWorker.start = no_op_start
+    LoggingWorker.add_log = no_op_add_log
+    
+    # Stop and destroy any existing worker instance
+    if hasattr(LoggingWorker, '_instance') and LoggingWorker._instance is not None:
+        worker = LoggingWorker._instance
+        if hasattr(worker, '_task') and worker._task is not None:
+            try:
+                worker._task.cancel()
+            except:
+                pass
+        LoggingWorker._instance = None
+    
+    print("✓ LoggingWorker successfully patched to prevent event loop issues")
+        
+except (ImportError, AttributeError, Exception) as e:
+    # If we can't patch the worker, log it but continue
+    print(f"Warning: Could not patch LoggingWorker: {e}")
 
 import pytest
 
@@ -87,13 +141,78 @@ def puzzle_file_option(request):
 # Note: event_loop fixture is automatically provided by pytest-asyncio
 # with session scope via pytest.ini: asyncio_default_fixture_loop_scope = session
 
+@pytest.fixture(scope="session", autouse=True)
+async def configure_litellm_in_loop():
+    """
+    Configure litellm within the pytest event loop to prevent queue binding issues.
+    
+    This fixture runs automatically once per test session, inside the session-scoped event loop.
+    It ensures that litellm's async resources are properly configured in the correct loop.
+    """
+    # Ensure litellm logging is disabled
+    litellm.turn_off_message_logging = True
+    litellm.suppress_debug_info = True
+    
+    # Aggressively stop any existing logging worker that might be bound to a different loop
+    try:
+        from litellm.litellm_core_utils.logging_worker import LoggingWorker
+        
+        # Stop and destroy any existing worker instance
+        if hasattr(LoggingWorker, '_instance'):
+            worker = LoggingWorker._instance
+            if worker is not None:
+                # Cancel the worker task
+                if hasattr(worker, '_task') and worker._task is not None:
+                    worker._task.cancel()
+                    try:
+                        await asyncio.wait_for(worker._task, timeout=0.5)
+                    except (asyncio.CancelledError, asyncio.TimeoutError, RuntimeError):
+                        # RuntimeError might occur if task is in different loop
+                        pass
+                
+                # Close the queue if it exists
+                if hasattr(worker, '_queue') and worker._queue is not None:
+                    try:
+                        # Clear any pending items
+                        while not worker._queue.empty():
+                            try:
+                                worker._queue.get_nowait()
+                            except:
+                                break
+                    except:
+                        pass
+                
+                # Destroy the instance
+                LoggingWorker._instance = None
+        
+        # Ensure the start method is still patched to no-op
+        LoggingWorker.start = lambda self: None
+                
+        logger.info("✓ LiteLLM logging worker cleaned up successfully")
+    except Exception as e:
+        logger.warning(f"Note: Could not fully clean up logging worker: {e}")
+    
+    yield
+    
+    # Cleanup after tests
+    try:
+        from litellm.litellm_core_utils.logging_worker import LoggingWorker
+        if hasattr(LoggingWorker, '_instance') and LoggingWorker._instance is not None:
+            worker = LoggingWorker._instance
+            if hasattr(worker, '_task') and worker._task is not None:
+                try:
+                    worker._task.cancel()
+                except:
+                    pass
+    except Exception:
+        pass
+
 
 def pytest_configure(config):
     """Configure pytest with custom markers and settings."""
-    # Note: LITELLM_DISABLE_LOGGING_WORKER is already set at module level (before imports)
-    # but we verify it here for safety
-    assert os.environ.get("LITELLM_DISABLE_LOGGING_WORKER") == "true", \
-        "LiteLLM logging worker should be disabled"
+    # Verify litellm logging was disabled at module level
+    # This prevents "bound to a different event loop" errors with pytest-asyncio
+    logger.info(f"✓ LiteLLM logging configuration: turn_off_message_logging={litellm.turn_off_message_logging}")
     
     # Register custom markers
     config.addinivalue_line(

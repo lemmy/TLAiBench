@@ -62,6 +62,8 @@ from typing import Optional
 
 import pytest
 
+# Note: conftest.py configures litellm to avoid event loop issues before importing translate
+# This prevents "bound to a different event loop" errors with pytest-asyncio's session-scoped loop
 from translate import TLATranslator, detect_workspace_root, setup_environment
 
 # Configure logging
