@@ -23,10 +23,10 @@ on:
         type: string
         default: ''
       puzzle_files:
-        description: 'Puzzle files to process (space-separated)'
+        description: 'Puzzle file to test (e.g., DieHard.md or puzzles/DieHard.md). Leave empty to test all puzzles.'
         required: false
         type: string
-        default: '../puzzles/DieHard.md'
+        default: 'puzzles/DieHard.md'
       debug:
         description: 'Enable debug logging'
         required: false
@@ -37,6 +37,8 @@ permissions:
     models: read
     id-token: write   # required for OIDC
     contents: read
+    checks: write     # required for publishing test results
+    pull-requests: write  # required for commenting on PRs with test results
 
 jobs:
   benchmarks:
@@ -156,29 +158,39 @@ jobs:
       ## Run TLAi benchmarks
       ##
 
-      - name: Run Python translate script on the logic puzzles
+      - name: Run pytest test suite on the logic puzzles
         run: |
-          # Build command arguments
-          ARGS="--model ${{ github.event.inputs.model }}"
+          # Build pytest command arguments
+          ARGS="-v python/test_translate.py"
+          
+          # Add JUnit XML report for GitHub Actions
+          ARGS="$ARGS --junitxml=test-results/pytest-results.xml"
+          
+          # Add model configuration
+          ARGS="$ARGS --model ${{ github.event.inputs.model }}"
           
           # Add model_id if provided (for AWS Bedrock)
           if [ -n "${{ github.event.inputs.model_id }}" ]; then
             ARGS="$ARGS --model-id ${{ github.event.inputs.model_id }}"
           fi
           
-          # Add debug flag if enabled
+          # Add MCP URL
+          ARGS="$ARGS --mcp-url ${{ steps.tunnel.outputs.tunnel_url }}/mcp"
+          
+          # Add debug logging if enabled
           if [ "${{ github.event.inputs.debug }}" = "true" ]; then
-            ARGS="$ARGS --debug"
+            ARGS="$ARGS --log-cli-level=DEBUG"
           fi
           
-          # Add  --mcp-url ${{ steps.tunnel.outputs.tunnel_url }}/mcp
-          ARGS="$ARGS --mcp-url ${{ steps.tunnel.outputs.tunnel_url }}/mcp"
-
-          # Add puzzle files
-          ARGS="$ARGS ${{ github.event.inputs.puzzle_files }}"
+          # Add puzzle file if specified (otherwise runs all puzzles)
+          if [ -n "${{ github.event.inputs.puzzle_files }}" ]; then
+            # Extract first puzzle file (pytest runs one puzzle at a time)
+            PUZZLE_FILE=$(echo "${{ github.event.inputs.puzzle_files }}" | awk '{print $1}')
+            ARGS="$ARGS --puzzle-file $PUZZLE_FILE"
+          fi
           
-          echo "Running: python translate.py $ARGS"
-          python python/translate.py $ARGS
+          echo "Running: pytest $ARGS"
+          pytest $ARGS
         env:
           GITHUB_API_KEY: ${{ secrets.GITHUB_TOKEN }}
           AZURE_API_KEY: ${{ secrets.AZURE_API_KEY }}
@@ -186,6 +198,15 @@ jobs:
           AZURE_API_VERSION: ${{ secrets.AZURE_API_VERSION }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Publish test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: |
+            test-results/pytest-results.xml
+          check_name: 'TLAiBench Test Results'
+          comment_title: 'TLAiBench Test Results'
 
       ## Postprocess the TLAi benchmarks
       ##
@@ -195,6 +216,9 @@ jobs:
         run: |
           echo "=== Generated TLA+ files ==="
           ls -la *.tla *.cfg 2>/dev/null || echo "No TLA+ files generated"
+          
+          echo "=== Test results ==="
+          ls -la test-results/ 2>/dev/null || echo "No test results directory"
           
           echo "=== Python logs ==="
           # Show any log files if they exist
@@ -206,7 +230,7 @@ jobs:
           timestamp=$(date +%Y%m%d-%H%M%S)
           echo "timestamp=${timestamp}" >> $GITHUB_OUTPUT
 
-      - name: Archive generated TLA+ specs (if any)
+      - name: Archive generated TLA+ specs and test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -216,5 +240,6 @@ jobs:
             *.tla
             *.cfg
             python/*.log
+            test-results/
             !gold/*.tla
             !gold/*.cfg
